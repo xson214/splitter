@@ -2,21 +2,23 @@ import sys
 import os
 import subprocess
 import re
+import cv2
+import numpy as np
 from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QLabel,
     QTextEdit, QFileDialog, QSlider, QMessageBox, QHBoxLayout, 
     QListWidget, QProgressBar, QListWidgetItem, QSplitter,
     QGroupBox, QLineEdit, QCheckBox, QSpinBox, QTabWidget,
-    QFormLayout, QGraphicsView, QGraphicsScene, QGraphicsRectItem
+    QFormLayout, QGraphicsView, QGraphicsScene, QGraphicsRectItem, 
+    QGraphicsPixmapItem, QDialog
 )
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtMultimediaWidgets import QVideoWidget
 from PyQt5.QtCore import Qt, QUrl, QTime, QThread, pyqtSignal, QTimer, QRectF
-from PyQt5.QtGui import QPen, QBrush, QColor, QPainter
+from PyQt5.QtGui import QPen, QBrush, QColor, QPainter, QImage, QPixmap
 
 class ResizableRect(QGraphicsRectItem):
-    """A resizable rectangle for selecting crop region"""
     HANDLE_SIZE = 10
     
     def __init__(self, rect, parent=None):
@@ -30,7 +32,10 @@ class ResizableRect(QGraphicsRectItem):
         self.setBrush(QBrush(Qt.transparent))
         self.setPen(QPen(Qt.red, 2))
         self.resizing = False
-        self.crop_updated = pyqtSignal(QRectF)
+        self.crop_updated_callback = None
+    
+    def set_crop_callback(self, callback):
+        self.crop_updated_callback = callback
     
     def hoverMoveEvent(self, event):
         if self._is_in_resize_area(event.pos()):
@@ -52,15 +57,23 @@ class ResizableRect(QGraphicsRectItem):
             new_width = max(event.pos().x() - rect.x(), 20)
             new_height = max(event.pos().y() - rect.y(), 20)
             self.setRect(rect.x(), rect.y(), new_width, new_height)
-            self.crop_updated.emit(self.sceneBoundingRect())
+            if self.crop_updated_callback:
+                self.crop_updated_callback(self.sceneBoundingRect())
         else:
             super().mouseMoveEvent(event)
     
     def mouseReleaseEvent(self, event):
         self.resizing = False
         self.setCursor(Qt.ArrowCursor)
-        self.crop_updated.emit(self.sceneBoundingRect())
+        if self.crop_updated_callback:
+            self.crop_updated_callback(self.sceneBoundingRect())
         super().mouseReleaseEvent(event)
+    
+    def itemChange(self, change, value):
+        if change == QGraphicsRectItem.ItemPositionHasChanged:
+            if self.crop_updated_callback:
+                self.crop_updated_callback(self.sceneBoundingRect())
+        return super().itemChange(change, value)
     
     def _is_in_resize_area(self, pos):
         rect = self.rect()
@@ -69,54 +82,96 @@ class ResizableRect(QGraphicsRectItem):
             rect.bottom() - self.HANDLE_SIZE <= pos.y() <= rect.bottom()
         )
 
-class CropView(QVideoWidget):
-    """Custom video widget with a resizable crop rectangle"""
+class CropView(QGraphicsView):
     crop_updated = pyqtSignal(QRectF)
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.scene = QGraphicsScene(self)
-        self.view = QGraphicsView(self.scene, self)
-        self.view.setStyleSheet("border: 0px")
-        self.view.setRenderHint(QPainter.Antialiasing)
+        self.setScene(self.scene)
+        self.setRenderHint(QPainter.Antialiasing)
         self.rect_item = None
         self.video_width = 0
         self.video_height = 0
+        self.crop_updated_callback = None
     
-    def setVideoSize(self, width, height):
-        """Set video dimensions and initialize crop rectangle"""
-        self.video_width = width
-        self.video_height = height
-        if width > 0 and height > 0:
-            self.scene.setSceneRect(0, 0, width, height)
-            self.view.setSceneRect(0, 0, width, height)
-            # Initialize crop rectangle (default to 50% of video size, centered)
-            rect_width = width * 0.5
-            rect_height = height * 0.5
-            rect_x = (width - rect_width) / 2
-            rect_y = (height - rect_height) / 2
-            self.rect_item = ResizableRect(QRectF(rect_x, rect_y, rect_width, rect_height))
-            self.rect_item.crop_updated.connect(self.on_crop_updated)
+    def set_crop_callback(self, callback):
+        self.crop_updated_callback = callback
+    
+    def setVideoFrame(self, frame):
+        try:
+            if frame is None:
+                print("Khung hình rỗng")
+                return
+                
+            self.video_height, self.video_width = frame.shape[:2]
+            self.scene.setSceneRect(0, 0, self.video_width, self.video_height)
+            
+            # Chuyển đổi frame OpenCV sang QImage
+            if len(frame.shape) == 3:
+                if frame.shape[2] == 3:  # RGB
+                    q_img = QImage(frame.data, self.video_width, self.video_height, 
+                                  frame.strides[0], QImage.Format_RGB888).rgbSwapped()
+                elif frame.shape[2] == 4:  # RGBA
+                    q_img = QImage(frame.data, self.video_width, self.video_height, 
+                                  frame.strides[0], QImage.Format_RGBA8888)
+                else:
+                    print(f"Định dạng khung hình không mong muốn: {frame.shape}")
+                    return
+            else:  # Grayscale
+                q_img = QImage(frame.data, self.video_width, self.video_height, 
+                              frame.strides[0], QImage.Format_Grayscale8)
+            
+            pixmap = QPixmap.fromImage(q_img)
+            self.scene.clear()
+            self.scene.addPixmap(pixmap)
+            
+            if not self.rect_item:
+                rect_width = self.video_width * 0.5
+                rect_height = self.video_height * 0.5
+                rect_x = (self.video_width - rect_width) / 2
+                rect_y = (self.video_height - rect_height) / 2
+                self.rect_item = ResizableRect(QRectF(rect_x, rect_y, rect_width, rect_height))
+                self.rect_item.set_crop_callback(self.on_crop_updated)
+            
             self.scene.addItem(self.rect_item)
+            self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+            
+        except Exception as e:
+            print(f"Lỗi trong setVideoFrame: {str(e)}")
+            import traceback
+            traceback.print_exc()
     
     def on_crop_updated(self, rect):
-        """Handle crop rectangle updates"""
+        if self.crop_updated_callback:
+            self.crop_updated_callback(rect)
         self.crop_updated.emit(rect)
     
     def resizeEvent(self, event):
-        """Adjust view size to match widget size"""
         super().resizeEvent(event)
-        self.view.setGeometry(0, 0, self.width(), self.height())
-    
-    def setCropEnabled(self, enabled):
-        """Show or hide crop rectangle"""
-        if self.rect_item:
-            self.rect_item.setVisible(enabled)
-            if not enabled:
-                self.rect_item.setRect(QRectF(0, 0, self.video_width, self.video_height))
+        if self.scene and self.scene.sceneRect().isValid():
+            self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
 
-class VideoProcessor(QThread):
-    """Separate thread for video processing to prevent UI freezing"""
+class FrameCaptureThread(QThread):
+    frame_captured = pyqtSignal(np.ndarray)
+    
+    def __init__(self, video_path):
+        super().__init__()
+        self.video_path = video_path
+        
+    def run(self):
+        try:
+            cap = cv2.VideoCapture(self.video_path)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                if ret:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    self.frame_captured.emit(frame_rgb)
+            cap.release()
+        except Exception as e:
+            print(f"Lỗi khi chụp khung hình: {str(e)}")
+
+class VideoSplitter(QThread):
     progress_updated = pyqtSignal(int)
     status_updated = pyqtSignal(str)
     finished_processing = pyqtSignal(int, str)
@@ -129,50 +184,95 @@ class VideoProcessor(QThread):
         self.output_folder = output_folder
         self.crop_params = crop_params
         
+    def time_to_seconds(self, time_str):
+        try:
+            parts = time_str.split(':')
+            if len(parts) == 3:  # HH:MM:SS
+                h, m, s = map(int, parts)
+                return h * 3600 + m * 60 + s
+            elif len(parts) == 2:  # MM:SS
+                m, s = map(int, parts)
+                return m * 60 + s
+            elif len(parts) == 1:  # SS
+                return int(parts[0])
+            else:
+                return None
+        except ValueError:
+            return None
+    
     def run(self):
-        """Process video cutting in background thread"""
         success_count = 0
-        total_segments = len(self.cut_points) - 1
+        total_segments = len(self.cut_points)
         
-        for i in range(total_segments):
+        if not os.path.exists(self.output_folder):
+            os.makedirs(self.output_folder)
+            self.status_updated.emit(f"📁 Đã tạo thư mục output: {self.output_folder}")
+        
+        for i, cut_point in enumerate(self.cut_points):
             try:
-                start_ms = self.cut_points[i]
-                end_ms = self.cut_points[i + 1]
-                duration = (end_ms - start_ms) / 1000
+                start_time, end_time = cut_point.split(" - ")
+                start_seconds = self.time_to_seconds(start_time)
+                end_seconds = self.time_to_seconds(end_time)
                 
-                start_time = QTime(0, 0, 0).addMSecs(start_ms).toString("HH:mm:ss")
+                if start_seconds is None or end_seconds is None:
+                    self.status_updated.emit(f"⚠️ Lỗi định dạng thời gian cho đoạn '{self.moments[i]}'")
+                    continue
+                
+                duration = end_seconds - start_seconds
+                if duration <= 0:
+                    self.status_updated.emit(f"⚠️ Khoảng thời gian không hợp lệ cho đoạn '{self.moments[i]}'")
+                    continue
+                
                 safe_name = self.sanitize_filename(self.moments[i])
                 output_file = os.path.join(self.output_folder, f"{safe_name}.mp4")
                 
-                self.status_updated.emit(f"Đang cắt đoạn {i+1}/{total_segments}: {safe_name}")
+                self.status_updated.emit(f"🔪 Đang cắt đoạn {i+1}/{total_segments}: {safe_name}")
                 
-                command = ["ffmpeg", "-ss", start_time, "-i", self.video_path, "-t", str(duration)]
+                command = [
+                    "ffmpeg",
+                    "-ss", start_time,
+                    "-i", self.video_path,
+                    "-t", str(duration),
+                    "-c:v", "libx264",
+                    "-c:a", "aac",
+                    "-y",
+                    output_file
+                ]
                 
                 if self.crop_params:
                     crop_filter = f"crop={self.crop_params['width']}:{self.crop_params['height']}:{self.crop_params['x']}:{self.crop_params['y']}"
-                    command.extend(["-vf", crop_filter, "-c:a", "copy"])
+                    command.extend(["-vf", crop_filter])
+                
+                process = subprocess.Popen(
+                    command, 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.STDOUT,
+                    universal_newlines=True
+                )
+                
+                # Đọc tiến trình từ FFmpeg
+                for line in process.stdout:
+                    if "time=" in line:
+                        time_str = line.split("time=")[1].split(" ")[0]
+                        self.status_updated.emit(f"⏱️ {safe_name}: {time_str}")
+                
+                process.wait()
+                
+                if process.returncode == 0:
+                    success_count += 1
+                    self.status_updated.emit(f"✅ Đã xuất thành công: {safe_name}.mp4")
                 else:
-                    command.extend(["-c", "copy"])
+                    self.status_updated.emit(f"❌ Lỗi khi cắt đoạn '{safe_name}'")
                 
-                command.extend(["-avoid_negative_ts", "make_zero", "-y", output_file])
-                
-                subprocess.run(command, check=True, capture_output=True, text=True, timeout=300)
-                
-                success_count += 1
                 progress = int((i + 1) / total_segments * 100)
                 self.progress_updated.emit(progress)
                 
-            except subprocess.CalledProcessError as e:
-                self.status_updated.emit(f"Lỗi ffmpeg khi cắt đoạn '{self.moments[i]}': {e.stderr}")
-            except subprocess.TimeoutExpired:
-                self.status_updated.emit(f"Timeout khi cắt đoạn '{self.moments[i]}'")
             except Exception as e:
-                self.status_updated.emit(f"Lỗi không xác định: {str(e)}")
+                self.status_updated.emit(f"❌ Lỗi không xác định: {str(e)}")
         
         self.finished_processing.emit(success_count, self.output_folder)
     
     def sanitize_filename(self, name):
-        """Remove invalid characters from filename"""
         return re.sub(r'[<>:"/\\|?*]', "_", name.strip())
 
 class VideoSplitterApp(QWidget):
@@ -187,6 +287,7 @@ class VideoSplitterApp(QWidget):
         self.processor_thread = None
         self.video_width = 0
         self.video_height = 0
+        self.crop_rect = None
         
         self.setFocusPolicy(Qt.StrongFocus)
         
@@ -209,9 +310,7 @@ class VideoSplitterApp(QWidget):
         msg.setIcon(QMessageBox.Critical)
         msg.setWindowTitle("Thiếu phụ thuộc")
         msg.setText("Không tìm thấy FFmpeg!")
-        msg.setInformativeText(
-            "Ứng dụng cần FFmpeg để hoạt động.\n\n"
-        )
+        msg.setInformativeText("Ứng dụng cần FFmpeg để hoạt động.")
         msg.exec_()
         sys.exit(1)
         
@@ -239,6 +338,29 @@ class VideoSplitterApp(QWidget):
         split_crop_widget.setLayout(split_crop_layout)
         
         self.tab_widget.addTab(split_crop_widget, "🎬 Cắt & Crop Video")
+        
+        self.crop_tab = QWidget()
+        crop_layout = QVBoxLayout()
+        
+        self.crop_view = CropView()
+        crop_layout.addWidget(QLabel("Chọn vùng crop (kéo và thay đổi kích thước hình chữ nhật):"))
+        crop_layout.addWidget(self.crop_view)
+        
+        crop_btn_layout = QHBoxLayout()
+        self.confirm_crop_btn = QPushButton("Xác nhận vùng crop")
+        self.confirm_crop_btn.clicked.connect(self.confirm_crop_selection)
+        self.cancel_crop_btn = QPushButton("Hủy bỏ")
+        self.cancel_crop_btn.clicked.connect(self.cancel_crop_selection)
+        
+        crop_btn_layout.addWidget(self.confirm_crop_btn)
+        crop_btn_layout.addWidget(self.cancel_crop_btn)
+        crop_layout.addLayout(crop_btn_layout)
+        
+        self.crop_tab.setLayout(crop_layout)
+        self.tab_widget.addTab(self.crop_tab, "🔲 Chọn Vùng Crop")
+        self.tab_widget.setTabEnabled(1, False)
+        
+        self.crop_view.crop_updated.connect(self.handle_crop_updated)
         
         main_layout.addWidget(self.tab_widget)
         self.setLayout(main_layout)
@@ -279,6 +401,20 @@ class VideoSplitterApp(QWidget):
                 background-color: #cccccc;
                 color: #666666;
             }
+            QGraphicsView {
+                border: 1px solid #cccccc;
+                background-color: #000000;
+            }
+            QProgressBar {
+                border: 1px solid #cccccc;
+                border-radius: 3px;
+                text-align: center;
+                background-color: #e0e0e0;
+            }
+            QProgressBar::chunk {
+                background-color: #4CAF50;
+                width: 10px;
+            }
         """)
         
     def create_control_panel(self):
@@ -301,7 +437,7 @@ class VideoSplitterApp(QWidget):
         cut_group = QGroupBox("Điểm Cắt")
         cut_layout = QVBoxLayout()
         
-        self.add_cut_button = QPushButton("✂️ Thêm Điểm Cắt Tại Vị Trí Hiện Tại")
+        self.add_cut_button = QPushButton("✂️ Thêm Điểm Cắt")
         self.add_cut_button.clicked.connect(self.add_cut_point)
         self.add_cut_button.setEnabled(False)
         
@@ -344,67 +480,45 @@ class VideoSplitterApp(QWidget):
         output_layout.addWidget(self.auto_open_checkbox)
         output_group.setLayout(output_layout)
         
-        crop_group = QGroupBox("Cài Đặt Crop (Tùy chọn)")
+        crop_group = QGroupBox("Cài Đặt Crop")
         crop_layout = QFormLayout()
-        
-        self.enable_crop_checkbox = QCheckBox("Bật crop video")
-        self.enable_crop_checkbox.stateChanged.connect(self.toggle_crop_controls)
-        
-        self.crop_controls_widget = QWidget()
-        self.crop_controls_layout = QFormLayout()
         
         self.crop_x_spin = QSpinBox()
         self.crop_x_spin.setRange(0, 9999)
         self.crop_x_spin.setValue(0)
+        self.crop_x_spin.setEnabled(False)
         
         self.crop_y_spin = QSpinBox()
         self.crop_y_spin.setRange(0, 9999)
         self.crop_y_spin.setValue(0)
+        self.crop_y_spin.setEnabled(False)
         
         self.crop_width_spin = QSpinBox()
         self.crop_width_spin.setRange(1, 9999)
         self.crop_width_spin.setValue(1920)
+        self.crop_width_spin.setEnabled(False)
         
         self.crop_height_spin = QSpinBox()
         self.crop_height_spin.setRange(1, 9999)
         self.crop_height_spin.setValue(1080)
+        self.crop_height_spin.setEnabled(False)
         
-        preset_layout = QHBoxLayout()
-        self.preset_16_9_button = QPushButton("16:9")
-        self.preset_4_3_button = QPushButton("4:3")
-        self.preset_1_1_button = QPushButton("1:1")
-        self.preset_center_button = QPushButton("Giữa màn hình")
+        self.select_crop_btn = QPushButton("Chọn vùng crop...")
+        self.select_crop_btn.clicked.connect(self.select_crop_region)
+        self.select_crop_btn.setEnabled(False)
         
-        self.preset_16_9_button.clicked.connect(lambda: self.apply_crop_preset("16:9"))
-        self.preset_4_3_button.clicked.connect(lambda: self.apply_crop_preset("4:3"))
-        self.preset_1_1_button.clicked.connect(lambda: self.apply_crop_preset("1:1"))
-        self.preset_center_button.clicked.connect(lambda: self.apply_crop_preset("center"))
-        
-        preset_layout.addWidget(self.preset_16_9_button)
-        preset_layout.addWidget(self.preset_4_3_button)
-        preset_layout.addWidget(self.preset_1_1_button)
-        preset_layout.addWidget(self.preset_center_button)
-        
-        self.video_info_label = QLabel("Chưa có thông tin video")
-        
-        self.crop_controls_layout.addRow("Vị trí X:", self.crop_x_spin)
-        self.crop_controls_layout.addRow("Vị trí Y:", self.crop_y_spin)
-        self.crop_controls_layout.addRow("Chiều rộng:", self.crop_width_spin)
-        self.crop_controls_layout.addRow("Chiều cao:", self.crop_height_spin)
-        self.crop_controls_layout.addRow("Presets:", preset_layout)
-        self.crop_controls_widget.setLayout(self.crop_controls_layout)
-        self.crop_controls_widget.setVisible(False)
-        
-        crop_layout.addRow(self.enable_crop_checkbox)
-        crop_layout.addRow(self.crop_controls_widget)
-        crop_layout.addRow("Thông tin video:", self.video_info_label)
+        crop_layout.addRow("Vị trí X:", self.crop_x_spin)
+        crop_layout.addRow("Vị trí Y:", self.crop_y_spin)
+        crop_layout.addRow("Chiều rộng:", self.crop_width_spin)
+        crop_layout.addRow("Chiều cao:", self.crop_height_spin)
+        crop_layout.addRow(self.select_crop_btn)
         
         crop_group.setLayout(crop_layout)
         
         self.cut_button = QPushButton("🎬 BẮT ĐẦU CẮT VIDEO")
         self.cut_button.clicked.connect(self.start_cutting)
         self.cut_button.setEnabled(False)
-        self.cut_button.setStyleSheet("QPushButton { background-color: #FF6B35; }")
+        self.cut_button.setStyleSheet("QPushButton { background-color: #FF6B35; font-size: 14px; }")
         
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
@@ -429,9 +543,8 @@ class VideoSplitterApp(QWidget):
         panel = QWidget()
         layout = QVBoxLayout()
         
-        self.video_widget = CropView()
+        self.video_widget = QVideoWidget()
         self.video_widget.setMinimumHeight(400)
-        self.video_widget.crop_updated.connect(self.update_crop_from_video)
         
         control_layout = QHBoxLayout()
         
@@ -445,6 +558,7 @@ class VideoSplitterApp(QWidget):
         
         self.time_label = QLabel("00:00:00 / 00:00:00")
         self.time_label.setAlignment(Qt.AlignCenter)
+        self.time_label.setStyleSheet("font-weight: bold;")
         
         control_layout.addWidget(self.play_button)
         control_layout.addWidget(self.stop_button)
@@ -456,7 +570,7 @@ class VideoSplitterApp(QWidget):
         self.slider.sliderMoved.connect(self.set_position)
         self.slider.setEnabled(False)
         
-        layout.addWidget(QLabel("Video Preview (Kéo thả để chọn vùng crop khi bật crop):"))
+        layout.addWidget(QLabel("Video Preview:"))
         layout.addWidget(self.video_widget)
         layout.addLayout(control_layout)
         layout.addWidget(self.slider)
@@ -501,7 +615,7 @@ class VideoSplitterApp(QWidget):
             file_size = self.format_file_size(os.path.getsize(file_path))
             self.file_info_label.setText(f"📁 {file_name}\n💾 {file_size}")
             
-            self.get_video_info(file_path)
+            self.select_crop_btn.setEnabled(True)
             
             self.play_button.setEnabled(True)
             self.stop_button.setEnabled(True)
@@ -518,139 +632,66 @@ class VideoSplitterApp(QWidget):
         except Exception as e:
             self.show_error(f"Không thể tải video: {str(e)}")
     
-    def get_video_info(self, file_path):
-        try:
-            command = [
-                "ffprobe", "-v", "quiet", "-print_format", "json",
-                "-show_streams", "-select_streams", "v:0", file_path
-            ]
+    def select_crop_region(self):
+        if not self.video_path:
+            return
             
-            result = subprocess.run(command, capture_output=True, text=True, check=True)
-            import json
-            data = json.loads(result.stdout)
+        self.tab_widget.setCurrentIndex(1)
+        self.tab_widget.setTabEnabled(1, True)
+        
+        self.frame_capture_thread = FrameCaptureThread(self.video_path)
+        self.frame_capture_thread.frame_captured.connect(self.show_frame_for_crop)
+        self.frame_capture_thread.start()
+    
+    def show_frame_for_crop(self, frame):
+        self.crop_view.setVideoFrame(frame)
+        self.status_label.setText("Chọn vùng crop bằng cách kéo và thay đổi kích thước hình chữ nhật đỏ")
+    
+    def confirm_crop_selection(self):
+        if self.crop_view.rect_item:
+            scene_rect = self.crop_view.rect_item.sceneBoundingRect()
+            self.crop_rect = scene_rect
             
-            if data.get("streams"):
-                stream = data["streams"][0]
-                self.video_width = int(stream.get("width", 0))
-                self.video_height = int(stream.get("height", 0))
-                
-                self.video_info_label.setText(
-                    f"📺 {self.video_width} x {self.video_height} pixels"
-                )
-                
-                self.crop_x_spin.setMaximum(self.video_width - 1)
-                self.crop_y_spin.setMaximum(self.video_height - 1)
-                self.crop_width_spin.setMaximum(self.video_width)
-                self.crop_height_spin.setMaximum(self.video_height)
-                
-                self.crop_width_spin.setValue(self.video_width)
-                self.crop_height_spin.setValue(self.video_height)
-                
-                self.video_widget.setVideoSize(self.video_width, self.video_height)
-                
-                for btn in [self.preset_16_9_button, self.preset_4_3_button, 
-                           self.preset_1_1_button, self.preset_center_button]:
-                    btn.setEnabled(self.enable_crop_checkbox.isChecked())
-                    
-        except Exception as e:
-            self.video_info_label.setText("❌ Không thể lấy thông tin video")
-            print(f"Error getting video info: {e}")
+            self.crop_x_spin.setValue(int(scene_rect.x()))
+            self.crop_y_spin.setValue(int(scene_rect.y()))
+            self.crop_width_spin.setValue(int(scene_rect.width()))
+            self.crop_height_spin.setValue(int(scene_rect.height()))
+            
+            self.crop_x_spin.setEnabled(True)
+            self.crop_y_spin.setEnabled(True)
+            self.crop_width_spin.setEnabled(True)
+            self.crop_height_spin.setEnabled(True)
+            
+            self.tab_widget.setCurrentIndex(0)
+            self.status_label.setText("✅ Đã chọn vùng crop. Bạn có thể chỉnh sửa thủ công nếu cần.")
+    
+    def cancel_crop_selection(self):
+        self.crop_rect = None
+        self.tab_widget.setCurrentIndex(0)
+        self.status_label.setText("Hủy bỏ chọn vùng crop")
+    
+    def handle_crop_updated(self, rect):
+        self.crop_x_spin.setValue(int(rect.x()))
+        self.crop_y_spin.setValue(int(rect.y()))
+        self.crop_width_spin.setValue(int(rect.width()))
+        self.crop_height_spin.setValue(int(rect.height()))
+        self.crop_rect = rect
+        self.status_label.setText("✅ Vùng crop đã được cập nhật.")
     
     def keyPressEvent(self, event):
         if not self.video_path or self.video_duration == 0:
             return
             
         if event.key() == Qt.Key_Left:
-            new_position = max(0, self.media_player.position() - 1000)
+            new_position = max(0, self.media_player.position() - 5000)
             self.media_player.setPosition(new_position)
         elif event.key() == Qt.Key_Right:
-            new_position = min(self.video_duration, self.media_player.position() + 1000)
+            new_position = min(self.video_duration, self.media_player.position() + 5000)
             self.media_player.setPosition(new_position)
+        elif event.key() == Qt.Key_Space:
+            self.toggle_play()
         else:
             super().keyPressEvent(event)
-    
-    def toggle_crop_controls(self, state):
-        enabled = state == Qt.Checked
-        self.crop_controls_widget.setVisible(enabled)
-        
-        self.crop_x_spin.setEnabled(enabled)
-        self.crop_y_spin.setEnabled(enabled)
-        self.crop_width_spin.setEnabled(enabled)
-        self.crop_height_spin.setEnabled(enabled)
-        
-        for btn in [self.preset_16_9_button, self.preset_4_3_button, 
-                   self.preset_1_1_button, self.preset_center_button]:
-            btn.setEnabled(enabled and self.video_width > 0)
-        
-        self.video_widget.setCropEnabled(enabled)
-    
-    def update_crop_from_video(self, crop_rect):
-        if not self.enable_crop_checkbox.isChecked():
-            return
-            
-        x = int(crop_rect.x())
-        y = int(crop_rect.y())
-        width = int(crop_rect.width())
-        height = int(crop_rect.height())
-        
-        x = max(0, min(x, self.video_width - 1))
-        y = max(0, min(y, self.video_height - 1))
-        width = max(1, min(width, self.video_width - x))
-        height = max(1, min(height, self.video_height - y))
-        
-        self.crop_x_spin.setValue(x)
-        self.crop_y_spin.setValue(y)
-        self.crop_width_spin.setValue(width)
-        self.crop_height_spin.setValue(height)
-    
-    def apply_crop_preset(self, preset_type):
-        if not self.video_width or not self.video_height:
-            return
-            
-        if preset_type == "16:9":
-            target_ratio = 16/9
-            current_ratio = self.video_width / self.video_height
-            if current_ratio > target_ratio:
-                new_width = int(self.video_height * target_ratio)
-                new_height = self.video_height
-                x = (self.video_width - new_width) // 2
-                y = 0
-            else:
-                new_width = self.video_width
-                new_height = int(self.video_width / target_ratio)
-                x = 0
-                y = (self.video_height - new_height) // 2
-        elif preset_type == "4:3":
-            target_ratio = 4/3
-            current_ratio = self.video_width / self.video_height
-            if current_ratio > target_ratio:
-                new_width = int(self.video_height * target_ratio)
-                new_height = self.video_height
-                x = (self.video_width - new_width) // 2
-                y = 0
-            else:
-                new_width = self.video_width
-                new_height = int(self.video_width / target_ratio)
-                x = 0
-                y = (self.video_height - new_height) // 2
-        elif preset_type == "1:1":
-            size = min(self.video_width, self.video_height)
-            new_width = new_height = size
-            x = (self.video_width - size) // 2
-            y = (self.video_height - size) // 2
-        elif preset_type == "center":
-            new_width = int(self.video_width * 0.8)
-            new_height = int(self.video_height * 0.8)
-            x = (self.video_width - new_width) // 2
-            y = (self.video_height - new_height) // 2
-        
-        self.crop_x_spin.setValue(x)
-        self.crop_y_spin.setValue(y)
-        self.crop_width_spin.setValue(new_width)
-        self.crop_height_spin.setValue(new_height)
-        
-        if self.enable_crop_checkbox.isChecked() and self.video_widget.rect_item:
-            self.video_widget.rect_item.setRect(QRectF(x, y, new_width, new_height))
     
     def format_file_size(self, size_bytes):
         for unit in ['B', 'KB', 'MB', 'GB']:
@@ -675,35 +716,77 @@ class VideoSplitterApp(QWidget):
         if not self.video_path:
             return
             
-        position_ms = self.media_player.position()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Thêm Điểm Cắt")
+        layout = QVBoxLayout()
         
-        if position_ms in self.cut_points:
-            self.status_label.setText("⚠️ Điểm cắt này đã tồn tại!")
-            return
+        form_layout = QFormLayout()
+        start_time_input = QLineEdit()
+        start_time_input.setPlaceholderText("HH:MM:SS")
+        end_time_input = QLineEdit()
+        end_time_input.setPlaceholderText("HH:MM:SS")
+        
+        form_layout.addRow("Thời gian bắt đầu:", start_time_input)
+        form_layout.addRow("Thời gian kết thúc:", end_time_input)
+        
+        button_box = QHBoxLayout()
+        ok_button = QPushButton("OK")
+        cancel_button = QPushButton("Hủy")
+        
+        button_box.addWidget(ok_button)
+        button_box.addWidget(cancel_button)
+        
+        layout.addLayout(form_layout)
+        layout.addLayout(button_box)
+        
+        dialog.setLayout(layout)
+        
+        def validate_and_add():
+            start_time = start_time_input.text().strip()
+            end_time = end_time_input.text().strip()
             
-        self.cut_points.append(position_ms)
-        self.cut_points.sort()
+            time_pattern = r"^\d{2}:\d{2}:\d{2}$"
+            if not (re.match(time_pattern, start_time) and re.match(time_pattern, end_time)):
+                QMessageBox.warning(dialog, "Lỗi", "Định dạng thời gian phải là HH:MM:SS")
+                return
+                
+            cut_point = f"{start_time} - {end_time}"
+            if cut_point in self.cut_points:
+                QMessageBox.warning(dialog, "Lỗi", "Điểm cắt này đã tồn tại!")
+                return
+                
+            self.cut_points.append(cut_point)
+            self.cut_points.sort(key=lambda x: self.time_to_seconds(x.split(" - ")[0]))
+            self.update_cut_list()
+            self.update_cut_button_state()
+            self.status_label.setText(f"✅ Đã thêm điểm cắt: {cut_point}")
+            dialog.accept()
         
-        self.update_cut_list()
-        self.update_cut_button_state()
+        ok_button.clicked.connect(validate_and_add)
+        cancel_button.clicked.connect(dialog.reject)
         
-        time_str = self.format_time(position_ms)
-        self.status_label.setText(f"✅ Đã thêm điểm cắt tại {time_str}")
+        dialog.exec_()
         
+    def time_to_seconds(self, time_str):
+        try:
+            h, m, s = map(int, time_str.split(":"))
+            return h * 3600 + m * 60 + s
+        except ValueError:
+            return None
+    
     def update_cut_list(self):
         self.cut_list.clear()
-        for i in range(len(self.cut_points) - 1):
-            start_ms = self.cut_points[i]
-            end_ms = self.cut_points[i + 1]
-            start_time = self.format_time(start_ms)
-            end_time = self.format_time(end_ms)
-            item = QListWidgetItem(f"{i+1:02d}. {start_time} - {end_time}")
-            item.setData(Qt.UserRole, start_ms)
+        for i, cut_point in enumerate(self.cut_points):
+            item = QListWidgetItem(f"{i+1:02d}. {cut_point}")
+            item.setData(Qt.UserRole, cut_point)
             self.cut_list.addItem(item)
             
     def jump_to_cut(self, item):
-        position_ms = item.data(Qt.UserRole)
-        self.media_player.setPosition(position_ms)
+        cut_point = item.data(Qt.UserRole)
+        start_time = cut_point.split(" - ")[0]
+        start_seconds = self.time_to_seconds(start_time)
+        if start_seconds is not None:
+            self.media_player.setPosition(start_seconds * 1000)
         
     def clear_all_cuts(self):
         reply = QMessageBox.question(
@@ -725,7 +808,7 @@ class VideoSplitterApp(QWidget):
             
     def update_cut_button_state(self):
         has_video = self.video_path is not None
-        has_enough_cuts = len(self.cut_points) >= 2
+        has_enough_cuts = len(self.cut_points) >= 1
         self.cut_button.setEnabled(has_video and has_enough_cuts)
         
     def start_cutting(self):
@@ -736,7 +819,7 @@ class VideoSplitterApp(QWidget):
         output_folder = self.output_folder_input.text().strip()
         
         crop_params = None
-        if self.enable_crop_checkbox.isChecked():
+        if self.crop_rect:
             crop_params = {
                 'x': self.crop_x_spin.value(),
                 'y': self.crop_y_spin.value(),
@@ -757,7 +840,7 @@ class VideoSplitterApp(QWidget):
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         
-        self.processor_thread = VideoProcessor(
+        self.processor_thread = VideoSplitter(
             self.video_path, self.cut_points, moments, output_folder, crop_params
         )
         self.processor_thread.progress_updated.connect(self.progress_bar.setValue)
@@ -768,13 +851,20 @@ class VideoSplitterApp(QWidget):
     def validate_crop_params(self, crop_params):
         x, y, width, height = crop_params['x'], crop_params['y'], crop_params['width'], crop_params['height']
         
+        # Lấy kích thước video thực tế
+        cap = cv2.VideoCapture(self.video_path)
+        if cap.isOpened():
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+        
         if x + width > self.video_width:
             self.show_error(f"Vùng crop vượt quá chiều rộng video!\nX + Width = {x + width} > {self.video_width}")
-            return False
+            #return False
             
         if y + height > self.video_height:
             self.show_error(f"Vùng crop vượt quá chiều cao video!\nY + Height = {y + height} > {self.video_height}")
-            return False
+           # return False
             
         if width < 1 or height < 1:
             self.show_error("Chiều rộng và chiều cao crop phải lớn hơn 0!")
@@ -787,12 +877,12 @@ class VideoSplitterApp(QWidget):
             self.show_error("Vui lòng chọn video!")
             return False
             
-        if len(self.cut_points) < 2:
-            self.show_error("Cần ít nhất 2 điểm cắt!")
+        if len(self.cut_points) < 1:
+            self.show_error("Cần ít nhất 1 điểm cắt!")
             return False
             
         moments = self.get_segment_names()
-        expected_segments = len(self.cut_points) - 1
+        expected_segments = len(self.cut_points)
         
         if len(moments) != expected_segments:
             self.show_error(
@@ -805,11 +895,21 @@ class VideoSplitterApp(QWidget):
             self.show_error("Tất cả tên đoạn phải khác rỗng!")
             return False
             
-        if self.enable_crop_checkbox.isChecked():
-            if self.video_width == 0 or self.video_height == 0:
-                self.show_error("Không thể crop: Chưa có thông tin kích thước video!")
+        for cut_point in self.cut_points:
+            try:
+                start_time, end_time = cut_point.split(" - ")
+                start_seconds = self.time_to_seconds(start_time)
+                end_seconds = self.time_to_seconds(end_time)
+                if start_seconds is None or end_seconds is None:
+                    self.show_error(f"Định dạng thời gian không hợp lệ: {cut_point}")
+                    return False
+                if end_seconds <= start_seconds:
+                    self.show_error(f"Khoảng thời gian không hợp lệ: {cut_point}")
+                    return False
+            except ValueError:
+                self.show_error(f"Định dạng điểm cắt không hợp lệ: {cut_point}")
                 return False
-            
+                
         return True
         
     def get_segment_names(self):
@@ -821,14 +921,17 @@ class VideoSplitterApp(QWidget):
     def set_ui_enabled(self, enabled):
         self.open_button.setEnabled(enabled)
         self.add_cut_button.setEnabled(enabled and self.video_path)
-        self.cut_button.setEnabled(enabled and len(self.cut_points) >= 2)
+        self.cut_button.setEnabled(enabled and len(self.cut_points) >= 1)
         self.clear_cuts_button.setEnabled(enabled)
+        self.select_crop_btn.setEnabled(enabled and self.video_path)
+        self.browse_output_button.setEnabled(enabled)
+        self.auto_open_checkbox.setEnabled(enabled)
         
     def on_processing_finished(self, success_count, output_folder):
         self.set_ui_enabled(True)
         self.progress_bar.setVisible(False)
         
-        total_segments = len(self.cut_points) - 1
+        total_segments = len(self.cut_points)
         
         if success_count == total_segments:
             msg_text = f"🎉 Hoàn thành! Đã cắt thành công {success_count}/{total_segments} đoạn."
@@ -877,6 +980,7 @@ class VideoSplitterApp(QWidget):
     def duration_changed(self, duration):
         self.slider.setRange(0, duration)
         self.video_duration = duration
+        self.update_time_display()
         
     def update_time_display(self):
         if self.video_duration > 0:
@@ -896,7 +1000,7 @@ class VideoSplitterApp(QWidget):
         self.status_label.setText(f"❌ {message}")
         
     def closeEvent(self, event):
-        if self.processor_thread and self.processor_thread.isRunning():
+        if hasattr(self, 'processor_thread') and self.processor_thread and self.processor_thread.isRunning():
             reply = QMessageBox.question(
                 self, "Xác nhận thoát",
                 "Đang xử lý video. Bạn có chắc muốn thoát?",
@@ -914,7 +1018,7 @@ class VideoSplitterApp(QWidget):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Video Splitter")
+    app.setApplicationName("Video Splitter Pro")
     app.setApplicationVersion("2.0")
     app.setOrganizationName("VideoTools")
     
